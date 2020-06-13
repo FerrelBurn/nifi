@@ -209,6 +209,18 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
             }
         });
 
+    private final ExecutorService deleteProcessorGroupThreadPool = new ThreadPoolExecutor(1, 50, 5L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<Runnable>(MAX_VARIABLE_REGISTRY_UPDATE_REQUESTS),
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(final Runnable r) {
+                    final Thread thread = Executors.defaultThreadFactory().newThread(r);
+                    thread.setName("Delete Proccessor Group Thread");
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            });
+
     /**
      * Populates the remaining fields in the specified process groups.
      *
@@ -2269,6 +2281,165 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
         // generate the response
         return generateOkResponse(entity).build();
     }
+
+
+
+    /**
+     * Removes the specified process group reference.
+     *
+     * @param httpServletRequest request
+     * @param groupId                 The id of the process group to be removed.
+     * @return response.
+     */
+    @DELETE
+    @Consumes(MediaType.WILDCARD)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("{id}/recursive")
+    @ApiOperation(
+            value = "Deletes a processors in and children in process group",
+            response = ProcessGroupEntity.class,
+            authorizations = {
+                    @Authorization(value = "Write - /process-groups/{uuid}/processors"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}/processors"),
+                    @Authorization(value = "Read - any referenced Controller Services by any encapsulated components - /controller-services/{uuid}"),
+                    @Authorization(value = "Write - /{component-type}/{uuid} - For all encapsulated components")
+            }
+    )
+    @ApiResponses(
+            value = {
+                    @ApiResponse(code = 400, message = "NiFi was unable to complete the request because it was invalid. The request should not be retried without modification."),
+                    @ApiResponse(code = 401, message = "Client could not be authenticated."),
+                    @ApiResponse(code = 403, message = "Client is not authorized to make this request."),
+                    @ApiResponse(code = 404, message = "The specified resource could not be found."),
+                    @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
+            }
+    )
+    public Response removeProcessors(
+            @Context final HttpServletRequest httpServletRequest,
+            @ApiParam(
+                    value = "The process group id.",
+                    required = true
+            )
+            @PathParam("id") final String groupId,
+            @ApiParam("Whether or not to include processors from descendant process groups")
+            @QueryParam("includeDescendantGroups")
+            @DefaultValue("true") boolean includeDescendantGroups,
+            @QueryParam(VERSION) final LongParameter version,
+            @ApiParam(
+                    value = "If the client id is not specified, new one will be generated. This value (whether specified or generated) is included in the response.",
+                    required = false
+            )
+            @QueryParam(CLIENT_ID)
+            @DefaultValue(StringUtils.EMPTY)
+            final ClientIdParameter clientId,
+            @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED)
+            @DefaultValue("false")
+            final Boolean disconnectedNodeAcknowledged
+    )
+    {
+
+        // update the variable registry
+        ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(groupId);
+
+        final Runnable removeTask = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Set<String> parentComponentIds = new HashSet();
+                    Set<Revision> parentProcessorRevisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> parentComponentIds);
+                    Map<String, Revision> parentGroupIdRevisionMap = parentProcessorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                    serviceFacade.verifyScheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap.keySet());
+                    serviceFacade.scheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap);
+
+                    Set<ProcessGroupEntity> processorGroups = serviceFacade.getProcessGroups(parentGroup.getId());
+
+
+                    final ProcessGroupEntity requestProcessGroupEntity = new ProcessGroupEntity();
+                    requestProcessGroupEntity.setId(groupId);
+
+                    final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), groupId);
+
+                    for (ProcessGroupEntity processorGroup : processorGroups) {
+
+                        Set<String> componentIds = new HashSet();
+                        Set<Revision> processorRevisions = serviceFacade.getRevisionsFromGroup(processorGroup.getId(), group -> componentIds);
+                        Map<String, Revision> processorRevisionMap = processorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                        serviceFacade.verifyScheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap.keySet());
+                        serviceFacade.scheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap);
+
+
+                        // handle expects request (usually from the cluster manager)
+                        //  final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), id);
+                        Response response = withWriteLock(
+                                serviceFacade,
+                                requestProcessGroupEntity,
+                                requestRevision,
+                                lookup -> {
+                                    final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(processorGroup.getId());
+
+                                    // ensure write to this process group and all encapsulated components including templates and controller services. additionally, ensure
+                                    // read to any referenced services by encapsulated components
+                                    authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
+
+                                    // ensure write permission to the parent process group, if applicable... if this is the root group the
+                                    // request will fail later but still need to handle authorization here
+                                    final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
+                                    if (parentAuthorizable != null) {
+                                        parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                                    }
+                                },
+                                () -> serviceFacade.verifyDeleteProcessGroup(processorGroup.getId()),
+                                (revision, processGroupEntity) -> {
+                                    // delete the process group
+                                    final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
+
+                                    // prune response as necessary
+                                    if (entity.getComponent() != null) {
+                                        entity.getComponent().setContents(null);
+                                    }
+
+                                    // create the response
+                                    return generateOkResponse(entity).build();
+                                }
+                        );
+                    }
+                    // Set complete
+                    //TODO
+                    //  updateRequest.setComplete(true);
+                    //updateRequest.setLastUpdated(new Date());
+                } catch (final Exception e) {
+                    logger.error("Failed to remove for Processor Group with ID " + groupId, e);
+                    //TODO
+                    // updateRequest.setComplete(true);
+                    // updateRequest.setFailureReason("An unexpected error has occurred: " + e);
+                } finally {
+                    // clear the authentication token
+                    SecurityContextHolder.getContext().setAuthentication(null);
+                }
+            }
+        };
+
+        // Submit the task to be run in the background
+        deleteProcessorGroupThreadPool.submit(removeTask);
+
+        //  final VariableRegistryUpdateRequestEntity responseEntity = new VariableRegistryUpdateRequestEntity();
+        //responseEntity.setRequest(dtoFactory.createVariableRegistryUpdateRequestDto(updateRequest));
+        //responseEntity.setProcessGroupRevision(updateRequest.getProcessGroupRevision());
+        //responseEntity.getRequest().setUri(generateResourceUri("process-groups", groupId, "processors", "update-requests", updateRequest.getRequestId()));
+
+        //final URI location = URI.create(responseEntity.getRequest().getUri());
+        return  generateOkResponse(parentGroup).build();
+        // return Response.status(Status.ACCEPTED).build();
+        //.location(location).entity(responseEntity).build();
+    }
+
+
 
     // -----------
     // input ports
