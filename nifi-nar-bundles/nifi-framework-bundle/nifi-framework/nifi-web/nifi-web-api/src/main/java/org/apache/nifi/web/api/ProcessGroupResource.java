@@ -1694,6 +1694,133 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
         );
     }
 
+
+    public Response removeProcessors(
+            @Context final HttpServletRequest httpServletRequest,
+            @ApiParam(
+                    value = "The process group id.",
+                    required = true
+            )
+            @PathParam("id") final String groupId,
+            @ApiParam("Whether or not to include processors from descendant process groups")
+            @QueryParam("includeDescendantGroups")
+            @DefaultValue("true") boolean includeDescendantGroups,
+            @QueryParam(VERSION) final LongParameter version,
+            @ApiParam(
+                    value = "If the client id is not specified, new one will be generated. This value (whether specified or generated) is included in the response.",
+                    required = false
+            )
+            @QueryParam(CLIENT_ID)
+            @DefaultValue(StringUtils.EMPTY)
+            final ClientIdParameter clientId,
+            @ApiParam(
+                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
+                    required = false
+            )
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED)
+            @DefaultValue("false")
+            final Boolean disconnectedNodeAcknowledged
+    )
+    {
+
+        // update the variable registry
+        ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(groupId);
+
+        final Runnable removeTask = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Set<String> parentComponentIds = new HashSet();
+                    Set<Revision> parentProcessorRevisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> parentComponentIds);
+                    Map<String, Revision> parentGroupIdRevisionMap = parentProcessorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                    serviceFacade.verifyScheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap.keySet());
+                    serviceFacade.scheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap);
+
+                    Set<ProcessGroupEntity> processorGroups = serviceFacade.getProcessGroups(parentGroup.getId());
+
+
+                    final ProcessGroupEntity requestProcessGroupEntity = new ProcessGroupEntity();
+                    requestProcessGroupEntity.setId(groupId);
+
+                    final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), groupId);
+
+                    for (ProcessGroupEntity processorGroup : processorGroups) {
+
+                        Set<String> componentIds = new HashSet();
+                        Set<Revision> processorRevisions = serviceFacade.getRevisionsFromGroup(processorGroup.getId(), group -> componentIds);
+                        Map<String, Revision> processorRevisionMap = processorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                        serviceFacade.verifyScheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap.keySet());
+                        serviceFacade.scheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap);
+                        a
+
+                        // handle expects request (usually from the cluster manager)
+                        //  final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), id);
+                        Response response = withWriteLock(
+                                serviceFacade,
+                                requestProcessGroupEntity,
+                                requestRevision,
+                                lookup -> {
+                                    final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(processorGroup.getId());
+
+                                    // ensure write to this process group and all encapsulated components including templates and controller services. additionally, ensure
+                                    // read to any referenced services by encapsulated components
+                                    authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
+
+                                    // ensure write permission to the parent process group, if applicable... if this is the root group the
+                                    // request will fail later but still need to handle authorization here
+                                    final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
+                                    if (parentAuthorizable != null) {
+                                        parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                                    }
+                                },
+                                () -> serviceFacade.verifyDeleteProcessGroup(processorGroup.getId()),
+                                (revision, processGroupEntity) -> {
+                                    // delete the process group
+                                    final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
+
+                                    // prune response as necessary
+                                    if (entity.getComponent() != null) {
+                                        entity.getComponent().setContents(null);
+                                    }
+
+                                    // create the response
+                                    return generateOkResponse(entity).build();
+                                }
+                        );
+                    }
+                    // Set complete
+                    //TODO
+                    //  updateRequest.setComplete(true);
+                    //updateRequest.setLastUpdated(new Date());
+                } catch (final Exception e) {
+                    logger.error("Failed to remove for Processor Group with ID " + groupId, e);
+                    //TODO
+                    // updateRequest.setComplete(true);
+                    // updateRequest.setFailureReason("An unexpected error has occurred: " + e);
+                } finally {
+                    // clear the authentication token
+                    SecurityContextHolder.getContext().setAuthentication(null);
+                }
+            }
+        };
+
+        // Submit the task to be run in the background
+        deleteProcessorGroupThreadPool.submit(removeTask);
+
+        //  final VariableRegistryUpdateRequestEntity responseEntity = new VariableRegistryUpdateRequestEntity();
+        //responseEntity.setRequest(dtoFactory.createVariableRegistryUpdateRequestDto(updateRequest));
+        //responseEntity.setProcessGroupRevision(updateRequest.getProcessGroupRevision());
+        //responseEntity.getRequest().setUri(generateResourceUri("process-groups", groupId, "processors", "update-requests", updateRequest.getRequestId()));
+
+        //final URI location = URI.create(responseEntity.getRequest().getUri());
+        return  generateOkResponse(parentGroup).build();
+        // return Response.status(Status.ACCEPTED).build();
+        //.location(location).entity(responseEntity).build();
+    }
+
+
     /**
      * Adds the specified process group.
      *
