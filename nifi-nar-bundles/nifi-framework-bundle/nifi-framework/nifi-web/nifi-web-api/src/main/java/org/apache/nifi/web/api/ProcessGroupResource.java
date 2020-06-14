@@ -26,16 +26,9 @@ import io.swagger.annotations.ApiResponses;
 import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.text.StringEscapeUtils;
-import org.apache.nifi.authorization.AuthorizableLookup;
-import org.apache.nifi.authorization.AuthorizeAccess;
-import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
-import org.apache.nifi.authorization.AuthorizeParameterReference;
-import org.apache.nifi.authorization.ComponentAuthorizable;
-import org.apache.nifi.authorization.ProcessGroupAuthorizable;
-import org.apache.nifi.authorization.RequestAction;
-import org.apache.nifi.authorization.SnippetAuthorizable;
-import org.apache.nifi.authorization.TemplateContentsAuthorizable;
+import org.apache.nifi.authorization.*;
 import org.apache.nifi.authorization.resource.Authorizable;
+import org.apache.nifi.authorization.resource.OperationAuthorizable;
 import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.authorization.user.NiFiUserDetails;
 import org.apache.nifi.authorization.user.NiFiUserUtils;
@@ -43,9 +36,13 @@ import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.components.ConfigurableComponent;
 import org.apache.nifi.connectable.ConnectableType;
+import org.apache.nifi.connectable.Port;
+import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.serialization.FlowEncodingVersion;
 import org.apache.nifi.controller.service.ControllerServiceState;
+import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.registry.bucket.Bucket;
 import org.apache.nifi.registry.client.NiFiRegistryException;
@@ -61,56 +58,11 @@ import org.apache.nifi.remote.util.SiteToSiteRestApiClient;
 import org.apache.nifi.security.xml.XmlUtils;
 import org.apache.nifi.web.ResourceNotFoundException;
 import org.apache.nifi.web.Revision;
-import org.apache.nifi.web.api.dto.AffectedComponentDTO;
-import org.apache.nifi.web.api.dto.BundleDTO;
-import org.apache.nifi.web.api.dto.ConnectionDTO;
-import org.apache.nifi.web.api.dto.ControllerServiceDTO;
-import org.apache.nifi.web.api.dto.FlowSnippetDTO;
-import org.apache.nifi.web.api.dto.PortDTO;
-import org.apache.nifi.web.api.dto.PositionDTO;
-import org.apache.nifi.web.api.dto.ProcessGroupDTO;
-import org.apache.nifi.web.api.dto.ProcessGroupReplaceRequestDTO;
-import org.apache.nifi.web.api.dto.ProcessorConfigDTO;
-import org.apache.nifi.web.api.dto.ProcessorDTO;
-import org.apache.nifi.web.api.dto.RemoteProcessGroupDTO;
-import org.apache.nifi.web.api.dto.RevisionDTO;
-import org.apache.nifi.web.api.dto.TemplateDTO;
-import org.apache.nifi.web.api.dto.VariableRegistryDTO;
-import org.apache.nifi.web.api.dto.VersionControlInformationDTO;
+import org.apache.nifi.web.api.dto.*;
 import org.apache.nifi.web.api.dto.flow.FlowDTO;
+import org.apache.nifi.web.api.dto.flow.ProcessGroupFlowDTO;
 import org.apache.nifi.web.api.dto.status.ProcessorStatusDTO;
-import org.apache.nifi.web.api.entity.ActivateControllerServicesEntity;
-import org.apache.nifi.web.api.entity.AffectedComponentEntity;
-import org.apache.nifi.web.api.entity.ConnectionEntity;
-import org.apache.nifi.web.api.entity.ConnectionsEntity;
-import org.apache.nifi.web.api.entity.ControllerServiceEntity;
-import org.apache.nifi.web.api.entity.ControllerServicesEntity;
-import org.apache.nifi.web.api.entity.CopySnippetRequestEntity;
-import org.apache.nifi.web.api.entity.CreateTemplateRequestEntity;
-import org.apache.nifi.web.api.entity.Entity;
-import org.apache.nifi.web.api.entity.FlowComparisonEntity;
-import org.apache.nifi.web.api.entity.FlowEntity;
-import org.apache.nifi.web.api.entity.FunnelEntity;
-import org.apache.nifi.web.api.entity.FunnelsEntity;
-import org.apache.nifi.web.api.entity.InputPortsEntity;
-import org.apache.nifi.web.api.entity.InstantiateTemplateRequestEntity;
-import org.apache.nifi.web.api.entity.LabelEntity;
-import org.apache.nifi.web.api.entity.LabelsEntity;
-import org.apache.nifi.web.api.entity.OutputPortsEntity;
-import org.apache.nifi.web.api.entity.ParameterContextReferenceEntity;
-import org.apache.nifi.web.api.entity.PortEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupImportEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupReplaceRequestEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupsEntity;
-import org.apache.nifi.web.api.entity.ProcessorEntity;
-import org.apache.nifi.web.api.entity.ProcessorsEntity;
-import org.apache.nifi.web.api.entity.RemoteProcessGroupEntity;
-import org.apache.nifi.web.api.entity.RemoteProcessGroupsEntity;
-import org.apache.nifi.web.api.entity.ScheduleComponentsEntity;
-import org.apache.nifi.web.api.entity.TemplateEntity;
-import org.apache.nifi.web.api.entity.VariableRegistryEntity;
-import org.apache.nifi.web.api.entity.VariableRegistryUpdateRequestEntity;
+import org.apache.nifi.web.api.entity.*;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
 import org.apache.nifi.web.security.token.NiFiAuthenticationToken;
@@ -162,7 +114,13 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.nifi.web.api.entity.ScheduleComponentsEntity.STATE_DISABLED;
+import static org.apache.nifi.web.api.entity.ScheduleComponentsEntity.STATE_ENABLED;
 
 /**
  * RESTful endpoint for managing a Group.
@@ -2146,6 +2104,15 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
         // generate the response
         return generateOkResponse(entity).build();
     }
+    /**
+     * Authorizes access to the flow.
+     */
+    private void authorizeFlow() {
+        serviceFacade.authorizeAccess(lookup -> {
+            final Authorizable flow = lookup.getFlow();
+            flow.authorize(authorizer, RequestAction.READ, NiFiUserUtils.getNiFiUser());
+        });
+    }
 
 
 
@@ -2159,7 +2126,7 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
     @DELETE
     @Consumes(MediaType.WILDCARD)
     @Produces(MediaType.APPLICATION_JSON)
-    @Path("{id}/recursive")
+    @Path("{id}/delete-all")
     @ApiOperation(
             value = "Deletes a processors in and children in process group",
             response = ProcessGroupEntity.class,
@@ -2189,18 +2156,6 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
             @ApiParam("Whether or not to include processors from descendant process groups")
             @QueryParam("includeDescendantGroups")
             @DefaultValue("true") boolean includeDescendantGroups,
-            @QueryParam(VERSION) final LongParameter version,
-            @ApiParam(
-                    value = "If the client id is not specified, new one will be generated. This value (whether specified or generated) is included in the response.",
-                    required = false
-            )
-            @QueryParam(CLIENT_ID)
-            @DefaultValue(StringUtils.EMPTY)
-            final ClientIdParameter clientId,
-            @ApiParam(
-                    value = "Acknowledges that this node is disconnected to allow for mutable requests to proceed.",
-                    required = false
-            )
             @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED)
             @DefaultValue("false")
             final Boolean disconnectedNodeAcknowledged
@@ -2210,33 +2165,30 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
         // update the variable registry
         ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(groupId);
 
-        final Runnable removeTask = new Runnable() {
-            @Override
-            public void run() {
+      //  final Runnable removeTask = new Runnable() {
+         //   @Override
+        //  public void run() {
                 try {
-                    Set<String> parentComponentIds = new HashSet();
-                    Set<Revision> parentProcessorRevisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> parentComponentIds);
-                    Map<String, Revision> parentGroupIdRevisionMap = parentProcessorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
-
-                    serviceFacade.verifyScheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap.keySet());
-                    serviceFacade.scheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap);
-
-                    Set<ProcessGroupEntity> processorGroups = serviceFacade.getProcessGroups(parentGroup.getId());
 
 
-                    final ProcessGroupEntity requestProcessGroupEntity = new ProcessGroupEntity();
-                    requestProcessGroupEntity.setId(groupId);
 
-                    final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), groupId);
+                    Set<ProcessGroupEntity> processorGroups = serviceFacade.getProcessGroups(groupId);
+
+
 
                     for (ProcessGroupEntity processorGroup : processorGroups) {
 
-                        Set<String> componentIds = new HashSet();
-                        Set<Revision> processorRevisions = serviceFacade.getRevisionsFromGroup(processorGroup.getId(), group -> componentIds);
-                        Map<String, Revision> processorRevisionMap = processorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+                        final Revision requestRevision = new Revision( processorGroup.getRevision().getVersion(), processorGroup.getRevision().getClientId() , processorGroup.getComponent().getId());
 
-                        serviceFacade.verifyScheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap.keySet());
-                        serviceFacade.scheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap);
+                        Set<String> componentIds = new HashSet();
+                      //  Set<Revision> processorRevisions = serviceFacade.getRevisionsFromGroup(processorGroup.getId(), group -> componentIds);
+                        //Map<String, Revision> processorRevisionMap = processorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                       // serviceFacade.verifyScheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap.keySet());
+                       // serviceFacade.scheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap);
+                        final ProcessGroupEntity requestProcessGroupEntity = new ProcessGroupEntity();
+                        requestProcessGroupEntity.setId(processorGroup.getId());
+
 
 
                         // handle expects request (usually from the cluster manager)
@@ -2274,34 +2226,143 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
                                 }
                         );
                     }
-                    // Set complete
-                    //TODO
-                    //  updateRequest.setComplete(true);
-                    //updateRequest.setLastUpdated(new Date());
+
+                    Set<String> parentComponentIds = new HashSet();
+
+                    Revision requestRevision = new Revision(parentGroup.getRevision().getVersion(),
+                                                           parentGroup.getRevision().getClientId(),
+                                                           parentGroup.getComponent().getId());
+
+                    Set<Revision> parentProcessorRevisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> parentComponentIds);
+                    Map<String, Revision> parentGroupIdRevisionMap = parentProcessorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
+
+                      serviceFacade.verifyScheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap.keySet());
+                     serviceFacade.scheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap);
+                     ProcessGroupFlowEntity fe = serviceFacade.getProcessGroupFlow(parentGroup.getId());
+                     ProcessGroupFlowDTO entityTest = fe.getProcessGroupFlow();
+                     FlowDTO flow = entityTest.getFlow();
+
+                     ProcessGroupDTO groupDTO= parentGroup.getComponent();
+                     FlowSnippetDTO flowSnippetDTO = groupDTO.getContents();
+                      Set<ConnectionDTO> connectionDTO = flowSnippetDTO.getConnections();
+
+
+                     for( ConnectionEntity connection : flow.getConnections()){
+                         final String dropRequestId = generateUuid();
+
+                         // submit the drop request
+                         final DropRequestDTO dropRequest = serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId);
+
+
+                         Revision rev = new Revision( connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
+
+                            serviceFacade.deleteConnection( rev, connection.getId());
+                        }
+
+
+                    for( PortEntity port : flow.getOutputPorts()){
+
+
+                        Revision rev = new Revision( port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
+                        serviceFacade.deleteOutputPort( rev, port.getId());
+                    }
+
+                    for( PortEntity port : flow.getInputPorts()){
+                        Revision rev = new Revision( port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
+                        serviceFacade.deleteInputPort( rev, port.getId());
+                    }
+
+                    for( FunnelEntity funnel : flow.getFunnels()){
+                        Revision rev = new Revision( funnel.getRevision().getVersion(), funnel.getRevision().getClientId(), funnel.getComponent().getId());
+                        serviceFacade.deleteFunnel( rev, funnel.getId());
+                    }
+
+
+                    for( ProcessGroupEntity processorGroupEntity: flow.getProcessGroups()){
+                        Revision rev = new Revision( processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
+                        serviceFacade.deleteProcessGroup( rev, processorGroupEntity.getId());
+                    }
+
+
+                    for( RemoteProcessGroupEntity processorGroupEntity: flow.getRemoteProcessGroups()){
+                        Revision rev = new Revision( processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
+                        serviceFacade.deleteRemoteProcessGroup( rev, processorGroupEntity.getId());
+                    }
+
+
+                    for( LabelEntity labelEntity: flow.getLabels()){
+                        Revision rev = new Revision( labelEntity.getRevision().getVersion(), labelEntity.getRevision().getClientId(), labelEntity.getComponent().getId());
+                        serviceFacade.deleteLabel( rev, labelEntity.getId());
+                    }
+
+
+
+
+
+
+                    for (ConnectionEntity  connection: serviceFacade.getConnections(parentGroup.getId())) {
+                       Revision rev = new Revision( connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
+                       serviceFacade.deleteFlowFileDropRequest(connection.getId(), UUID.randomUUID().toString() );
+
+                       serviceFacade.deleteConnection( rev, connection.getId());
+                   }
+                   Set<ControllerServiceEntity> controllers = serviceFacade.getControllerServices(parentGroup.getId(), true, true );
+                    for (ControllerServiceEntity  controller: controllers) {
+                        Revision rev = new Revision( controller.getRevision().getVersion(), controller.getRevision().getClientId(), controller.getComponent().getId());
+                        serviceFacade.deleteControllerService( rev, controller.getId());
+                    }
+
+
+
+
+
+
+                    // handle expects request (usually from the cluster manager)
+                    //  final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), id);
+                    Response response = withWriteLock(
+                            serviceFacade,
+                            parentGroup,
+                            requestRevision,
+                            lookup -> {
+                                final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(parentGroup.getId());
+
+                                // ensure write to this process group anEencapsulated components
+                                authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
+
+                                // ensure write permission to the parent process group, if applicable... if this is the root group the
+                                // request will fail later but still need to handle authorization here
+                                final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
+                                if (parentAuthorizable != null) {
+                                    parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                                }
+                            },
+                            () -> serviceFacade.verifyDeleteProcessGroup(parentGroup.getId()),
+                            (revision, processGroupEntity) -> {
+                                // delete the process group
+                                final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
+
+                                // prune response as necessary
+                                if (entity.getComponent() != null) {
+                                    entity.getComponent().setContents(null);
+                                }
+
+                                // create the response
+                                return generateOkResponse(entity).build();
+                            }
+                    );
+
                 } catch (final Exception e) {
                     logger.error("Failed to remove for Processor Group with ID " + groupId, e);
-                    //TODO
-                    // updateRequest.setComplete(true);
-                    // updateRequest.setFailureReason("An unexpected error has occurred: " + e);
                 } finally {
                     // clear the authentication token
                     SecurityContextHolder.getContext().setAuthentication(null);
                 }
-            }
-        };
+       //     }
+     //   };
 
         // Submit the task to be run in the background
-        deleteProcessorGroupThreadPool.submit(removeTask);
-
-        //  final VariableRegistryUpdateRequestEntity responseEntity = new VariableRegistryUpdateRequestEntity();
-        //responseEntity.setRequest(dtoFactory.createVariableRegistryUpdateRequestDto(updateRequest));
-        //responseEntity.setProcessGroupRevision(updateRequest.getProcessGroupRevision());
-        //responseEntity.getRequest().setUri(generateResourceUri("process-groups", groupId, "processors", "update-requests", updateRequest.getRequestId()));
-
-        //final URI location = URI.create(responseEntity.getRequest().getUri());
+     //   deleteProcessorGroupThreadPool.submit(removeTask);
         return  generateOkResponse(parentGroup).build();
-        // return Response.status(Status.ACCEPTED).build();
-        //.location(location).entity(responseEntity).build();
     }
 
 
@@ -4393,5 +4454,23 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
 
     public void setControllerServiceResource(ControllerServiceResource controllerServiceResource) {
         this.controllerServiceResource = controllerServiceResource;
+    }
+
+    private static class DropEntity extends Entity {
+        final String connectionId;
+        final String dropRequestId;
+
+        public DropEntity(String connectionId, String dropRequestId) {
+            this.connectionId = connectionId;
+            this.dropRequestId = dropRequestId;
+        }
+
+        public String getConnectionId() {
+            return connectionId;
+        }
+
+        public String getDropRequestId() {
+            return dropRequestId;
+        }
     }
 }
