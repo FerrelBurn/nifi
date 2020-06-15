@@ -158,18 +158,6 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
             }
         });
 
-    private final ExecutorService deleteProcessorGroupThreadPool = new ThreadPoolExecutor(1, 50, 5L, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<Runnable>(MAX_VARIABLE_REGISTRY_UPDATE_REQUESTS),
-            new ThreadFactory() {
-                @Override
-                public Thread newThread(final Runnable r) {
-                    final Thread thread = Executors.defaultThreadFactory().newThread(r);
-                    thread.setName("Delete Proccessor Group Thread");
-                    thread.setDaemon(true);
-                    return thread;
-                }
-            });
-
     /**
      * Populates the remaining fields in the specified process groups.
      *
@@ -2103,31 +2091,22 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
         // generate the response
         return generateOkResponse(entity).build();
     }
-    /**
-     * Authorizes access to the flow.
-     */
-    private void authorizeFlow() {
-        serviceFacade.authorizeAccess(lookup -> {
-            final Authorizable flow = lookup.getFlow();
-            flow.authorize(authorizer, RequestAction.READ, NiFiUserUtils.getNiFiUser());
-        });
-    }
-
-
 
     /**
      * Removes the specified process group reference.
      *
      * @param httpServletRequest request
      * @param groupId  The id of the process group to be removed.
+     * @param includeDescendantGroups include children
+     * @param disconnectedNodeAcknowledged for clustering
      * @return response.
      */
     @DELETE
     @Consumes(MediaType.WILDCARD)
     @Produces(MediaType.APPLICATION_JSON)
-    @Path("{id}/delete-all")
+    @Path("{id}/process-groups")
     @ApiOperation(
-            value = "Deletes a processors in and children in process group",
+            value = "Deletes a process group and all children components",
             response = ProcessGroupEntity.class,
             authorizations = {
                     @Authorization(value = "Write - /process-groups/{uuid}/processors"),
@@ -2145,7 +2124,7 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
                     @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
             }
     )
-    public Response removeProcessors(
+    public Response removeProcessorGroups(
             @Context final HttpServletRequest httpServletRequest,
             @ApiParam(
                     value = "The process group id.",
@@ -2441,6 +2420,216 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
                     }
                   );
               }
+
+        } catch (final Exception e) {
+            logger.error("Failed to remove for Processor Group with ID " + groupId, e);
+        } finally {
+            // clear the authentication token
+            SecurityContextHolder.getContext().setAuthentication(null);
+        }
+
+        return generateOkResponse(parentGroup).build();
+    }
+
+
+    /**
+     * Drops all request and empties flow file queue in process group
+     *
+     * @param httpServletRequest request
+     * @param groupId  The id of the process group to be removed.
+     * @param includeDescendantGroups include children
+     * @param disconnectedNodeAcknowledged for clustering
+     * @return response.
+     */
+    @DELETE
+    @Consumes(MediaType.WILDCARD)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("{id}/flow-drop-request")
+    @ApiOperation(
+            value = "Deletes a processors in and children in process group",
+            response = ProcessGroupEntity.class,
+            authorizations = {
+                    @Authorization(value = "Write - /process-groups/{uuid}/processors"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}/processors"),
+                    @Authorization(value = "Read - any referenced Controller Services by any encapsulated components - /controller-services/{uuid}"),
+                    @Authorization(value = "Write - /{component-type}/{uuid} - For all encapsulated components")
+            }
+    )
+    @ApiResponses(
+            value = {
+                    @ApiResponse(code = 400, message = "NiFi was unable to complete the request because it was invalid. The request should not be retried without modification."),
+                    @ApiResponse(code = 401, message = "Client could not be authenticated."),
+                    @ApiResponse(code = 403, message = "Client is not authorized to make this request."),
+                    @ApiResponse(code = 404, message = "The specified resource could not be found."),
+                    @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
+            }
+    )
+    public Response flowDropRequestProcessorGroups(
+            @Context final HttpServletRequest httpServletRequest,
+            @ApiParam(
+                    value = "The process group id.",
+                    required = true
+            )
+            @PathParam("id") final String groupId,
+            @ApiParam("Whether or not to include processors from descendant process groups")
+            @QueryParam("includeDescendantGroups")
+            @DefaultValue("true") boolean includeDescendantGroups,
+            @QueryParam(DISCONNECTED_NODE_ACKNOWLEDGED)
+            @DefaultValue("false")
+            final Boolean disconnectedNodeAcknowledged
+    )
+    {
+        final  ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(serviceFacade.getProcessGroup(groupId).getComponent().getParentGroupId()) !=null ?
+                serviceFacade.getProcessGroup(serviceFacade.getProcessGroup(groupId).getComponent().getParentGroupId()) :
+                serviceFacade.getProcessGroup(groupId);
+        try {
+            ScheduleComponentsEntity requestScheduleComponentsEntity = new ScheduleComponentsEntity();
+            requestScheduleComponentsEntity.setState(STATE_STOPPED);
+            final ScheduledState state;
+
+            if (isReplicateRequest()) {
+                return replicate(HttpMethod.PUT, requestScheduleComponentsEntity);
+            } else if (isDisconnectedFromCluster()) {
+                verifyDisconnectedNodeModification(requestScheduleComponentsEntity.isDisconnectedNodeAcknowledged());
+            }
+
+
+            if (requestScheduleComponentsEntity.getState() == null) {
+                throw new IllegalArgumentException("The scheduled state must be specified.");
+            } else {
+                if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                    state = ScheduledState.STOPPED;
+                } else {
+                    try {
+                        state = ScheduledState.valueOf(requestScheduleComponentsEntity.getState());
+                    } catch (final IllegalArgumentException iae) {
+                        throw new IllegalArgumentException(String.format("The scheduled must be one of [%s].",
+                                StringUtils.join(Stream.of(ScheduledState.RUNNING, ScheduledState.STOPPED, STATE_ENABLED, ScheduledState.DISABLED), ", ")));
+                    }
+                }
+            }
+
+            // ensure its a supported scheduled state
+            if (ScheduledState.STARTING.equals(state) || ScheduledState.STOPPING.equals(state)) {
+                throw new IllegalArgumentException(String.format("The scheduled must be one of [%s].",
+                        StringUtils.join(Stream.of(ScheduledState.RUNNING, ScheduledState.STOPPED, STATE_ENABLED, ScheduledState.DISABLED), ", ")));
+            }
+
+            // if the components are not specified, gather all components and their current revision
+            if (requestScheduleComponentsEntity.getComponents() == null) {
+                final Supplier<Predicate<ProcessorNode>> getProcessorFilter = () -> {
+                    if (ScheduledState.RUNNING.equals(state)) {
+                        return ProcessGroup.START_PROCESSORS_FILTER;
+                    } else if (ScheduledState.STOPPED.equals(state)) {
+                        if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                            return ProcessGroup.ENABLE_PROCESSORS_FILTER;
+                        } else {
+                            return ProcessGroup.STOP_PROCESSORS_FILTER;
+                        }
+                    } else {
+                        return ProcessGroup.DISABLE_PROCESSORS_FILTER;
+                    }
+                };
+
+                final Supplier<Predicate<Port>> getPortFilter = () -> {
+                    if (ScheduledState.RUNNING.equals(state)) {
+                        return ProcessGroup.START_PORTS_FILTER;
+                    } else if (ScheduledState.STOPPED.equals(state)) {
+                        if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                            return ProcessGroup.ENABLE_PORTS_FILTER;
+                        } else {
+                            return ProcessGroup.STOP_PORTS_FILTER;
+                        }
+                    } else {
+                        return ProcessGroup.DISABLE_PORTS_FILTER;
+                    }
+                };
+
+
+                // get the current revisions for the components being updated
+                final Set<Revision> revisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> {
+                    final Set<String> componentIds = new HashSet<>();
+
+                    // ensure authorized for each processor we will attempt to schedule
+                    group.findAllProcessors().stream()
+                            .filter(getProcessorFilter.get())
+                            //    .filter(processor -> OperationAuthorizable.isOperationAuthorized(processor, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(processor -> {
+                                componentIds.add(processor.getIdentifier());
+                            });
+
+                    // ensure authorized for each input port we will attempt to schedule
+                    group.findAllInputPorts().stream()
+                            .filter(getPortFilter.get())
+                            //  .filter(inputPort -> OperationAuthorizable.isOperationAuthorized(inputPort, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(inputPort -> {
+                                componentIds.add(inputPort.getIdentifier());
+                            });
+
+                    // ensure authorized for each output port we will attempt to schedule
+                    group.findAllOutputPorts().stream()
+                            .filter(getPortFilter.get())
+                            //.filter(outputPort -> OperationAuthorizable.isOperationAuthorized(outputPort, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(outputPort -> {
+                                componentIds.add(outputPort.getIdentifier());
+                            });
+
+                    return componentIds;
+                });
+
+                // build the component mapping
+                final Map<String, RevisionDTO> componentsToSchedule = new HashMap<>();
+                revisions.forEach(revision -> {
+                    final RevisionDTO dto = new RevisionDTO();
+                    dto.setClientId(revision.getClientId());
+                    dto.setVersion(revision.getVersion());
+                    componentsToSchedule.put(revision.getComponentId(), dto);
+                });
+
+                // set the components and their current revision
+                requestScheduleComponentsEntity.setComponents(componentsToSchedule);
+            }
+
+
+
+            final Map<String, RevisionDTO> requestComponentsToSchedule = requestScheduleComponentsEntity.getComponents();
+            final Map<String, Revision> requestComponentRevisions =
+                    requestComponentsToSchedule.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> getRevision(e.getValue(), e.getKey())));
+            final Set<Revision> requestRevisions = new HashSet<>(requestComponentRevisions.values());
+
+
+            //STOP all components
+            serviceFacade.verifyScheduleComponents(parentGroup.getId(), state, requestComponentRevisions.keySet());
+            serviceFacade.scheduleComponents(parentGroup.getId(), state, requestComponentRevisions);
+
+
+
+            Set<DropRequestDTO> allDropRequests = new HashSet();
+
+            //DROP all groupID request
+            for (ConnectionEntity connection : serviceFacade.getConnections(parentGroup.getId())) {
+                // ensure the id is the same across the cluster
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+
+                    String dropRequestId = generateUuid();
+                    allDropRequests.add(serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId));
+                }
+            }
+
+
+
+            ProcessGroupFlowEntity fe = serviceFacade.getProcessGroupFlow(parentGroup.getId());
+            ProcessGroupFlowDTO entityTest = fe.getProcessGroupFlow();
+            FlowDTO flow = entityTest.getFlow();
+            //Drop all flow connections
+            for (ConnectionEntity connection : flow.getConnections()) {
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+                    final String dropRequestId = generateUuid();
+                    allDropRequests.add(serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId));
+                }
+            }
+
+
 
         } catch (final Exception e) {
             logger.error("Failed to remove for Processor Group with ID " + groupId, e);
