@@ -119,8 +119,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.apache.nifi.web.api.entity.ScheduleComponentsEntity.STATE_DISABLED;
-import static org.apache.nifi.web.api.entity.ScheduleComponentsEntity.STATE_ENABLED;
+import static org.apache.nifi.web.api.entity.ScheduleComponentsEntity.*;
 
 /**
  * RESTful endpoint for managing a Group.
@@ -2161,208 +2160,296 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
             final Boolean disconnectedNodeAcknowledged
     )
     {
+       final  ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(serviceFacade.getProcessGroup(groupId).getComponent().getParentGroupId()) !=null ?
+                                               serviceFacade.getProcessGroup(serviceFacade.getProcessGroup(groupId).getComponent().getParentGroupId()) :
+                                               serviceFacade.getProcessGroup(groupId);
+        try {
+            ScheduleComponentsEntity requestScheduleComponentsEntity = new ScheduleComponentsEntity();
+            requestScheduleComponentsEntity.setState(STATE_STOPPED);
+            final ScheduledState state;
 
-        // update the variable registry
-        ProcessGroupEntity parentGroup = serviceFacade.getProcessGroup(groupId);
-
-      //  final Runnable removeTask = new Runnable() {
-         //   @Override
-        //  public void run() {
-                try {
-
-
-
-                    Set<ProcessGroupEntity> processorGroups = serviceFacade.getProcessGroups(groupId);
-
-
-
-                    for (ProcessGroupEntity processorGroup : processorGroups) {
-
-                        final Revision requestRevision = new Revision( processorGroup.getRevision().getVersion(), processorGroup.getRevision().getClientId() , processorGroup.getComponent().getId());
-
-                        Set<String> componentIds = new HashSet();
-                      //  Set<Revision> processorRevisions = serviceFacade.getRevisionsFromGroup(processorGroup.getId(), group -> componentIds);
-                        //Map<String, Revision> processorRevisionMap = processorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
-
-                       // serviceFacade.verifyScheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap.keySet());
-                       // serviceFacade.scheduleComponents(processorGroup.getId(), ScheduledState.STOPPED, processorRevisionMap);
-                        final ProcessGroupEntity requestProcessGroupEntity = new ProcessGroupEntity();
-                        requestProcessGroupEntity.setId(processorGroup.getId());
+            if (isReplicateRequest()) {
+                return replicate(HttpMethod.PUT, requestScheduleComponentsEntity);
+            } else if (isDisconnectedFromCluster()) {
+                verifyDisconnectedNodeModification(requestScheduleComponentsEntity.isDisconnectedNodeAcknowledged());
+            }
 
 
-
-                        // handle expects request (usually from the cluster manager)
-                        //  final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), id);
-                        Response response = withWriteLock(
-                                serviceFacade,
-                                requestProcessGroupEntity,
-                                requestRevision,
-                                lookup -> {
-                                    final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(processorGroup.getId());
-
-                                    // ensure write to this process group and all encapsulated components including templates and controller services. additionally, ensure
-                                    // read to any referenced services by encapsulated components
-                                    authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
-
-                                    // ensure write permission to the parent process group, if applicable... if this is the root group the
-                                    // request will fail later but still need to handle authorization here
-                                    final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
-                                    if (parentAuthorizable != null) {
-                                        parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
-                                    }
-                                },
-                                () -> serviceFacade.verifyDeleteProcessGroup(processorGroup.getId()),
-                                (revision, processGroupEntity) -> {
-                                    // delete the process group
-                                    final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
-
-                                    // prune response as necessary
-                                    if (entity.getComponent() != null) {
-                                        entity.getComponent().setContents(null);
-                                    }
-
-                                    // create the response
-                                    return generateOkResponse(entity).build();
-                                }
-                        );
+            if (requestScheduleComponentsEntity.getState() == null) {
+                throw new IllegalArgumentException("The scheduled state must be specified.");
+            } else {
+                if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                    state = ScheduledState.STOPPED;
+                } else {
+                    try {
+                        state = ScheduledState.valueOf(requestScheduleComponentsEntity.getState());
+                    } catch (final IllegalArgumentException iae) {
+                        throw new IllegalArgumentException(String.format("The scheduled must be one of [%s].",
+                                StringUtils.join(Stream.of(ScheduledState.RUNNING, ScheduledState.STOPPED, STATE_ENABLED, ScheduledState.DISABLED), ", ")));
                     }
+                }
+            }
 
-                    Set<String> parentComponentIds = new HashSet();
+            // ensure its a supported scheduled state
+            if (ScheduledState.STARTING.equals(state) || ScheduledState.STOPPING.equals(state)) {
+                throw new IllegalArgumentException(String.format("The scheduled must be one of [%s].",
+                        StringUtils.join(Stream.of(ScheduledState.RUNNING, ScheduledState.STOPPED, STATE_ENABLED, ScheduledState.DISABLED), ", ")));
+            }
 
-                    Revision requestRevision = new Revision(parentGroup.getRevision().getVersion(),
-                                                           parentGroup.getRevision().getClientId(),
-                                                           parentGroup.getComponent().getId());
+            // if the components are not specified, gather all components and their current revision
+            if (requestScheduleComponentsEntity.getComponents() == null) {
+                final Supplier<Predicate<ProcessorNode>> getProcessorFilter = () -> {
+                    if (ScheduledState.RUNNING.equals(state)) {
+                        return ProcessGroup.START_PROCESSORS_FILTER;
+                    } else if (ScheduledState.STOPPED.equals(state)) {
+                        if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                            return ProcessGroup.ENABLE_PROCESSORS_FILTER;
+                        } else {
+                            return ProcessGroup.STOP_PROCESSORS_FILTER;
+                        }
+                    } else {
+                        return ProcessGroup.DISABLE_PROCESSORS_FILTER;
+                    }
+                };
 
-                    Set<Revision> parentProcessorRevisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> parentComponentIds);
-                    Map<String, Revision> parentGroupIdRevisionMap = parentProcessorRevisions.stream().collect(Collectors.toMap(revision -> revision.getComponentId(), Function.identity()));
-
-                      serviceFacade.verifyScheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap.keySet());
-                     serviceFacade.scheduleComponents(parentGroup.getId(), ScheduledState.STOPPED, parentGroupIdRevisionMap);
-                     ProcessGroupFlowEntity fe = serviceFacade.getProcessGroupFlow(parentGroup.getId());
-                     ProcessGroupFlowDTO entityTest = fe.getProcessGroupFlow();
-                     FlowDTO flow = entityTest.getFlow();
-
-                     ProcessGroupDTO groupDTO= parentGroup.getComponent();
-                     FlowSnippetDTO flowSnippetDTO = groupDTO.getContents();
-                      Set<ConnectionDTO> connectionDTO = flowSnippetDTO.getConnections();
-
-
-                     for( ConnectionEntity connection : flow.getConnections()){
-                         final String dropRequestId = generateUuid();
-
-                         // submit the drop request
-                         final DropRequestDTO dropRequest = serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId);
+                final Supplier<Predicate<Port>> getPortFilter = () -> {
+                    if (ScheduledState.RUNNING.equals(state)) {
+                        return ProcessGroup.START_PORTS_FILTER;
+                    } else if (ScheduledState.STOPPED.equals(state)) {
+                        if (requestScheduleComponentsEntity.getState().equals(STATE_ENABLED)) {
+                            return ProcessGroup.ENABLE_PORTS_FILTER;
+                        } else {
+                            return ProcessGroup.STOP_PORTS_FILTER;
+                        }
+                    } else {
+                        return ProcessGroup.DISABLE_PORTS_FILTER;
+                    }
+                };
 
 
-                         Revision rev = new Revision( connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
+                // get the current revisions for the components being updated
+                final Set<Revision> revisions = serviceFacade.getRevisionsFromGroup(parentGroup.getId(), group -> {
+                    final Set<String> componentIds = new HashSet<>();
 
-                            serviceFacade.deleteConnection( rev, connection.getId());
+                    // ensure authorized for each processor we will attempt to schedule
+                    group.findAllProcessors().stream()
+                            .filter(getProcessorFilter.get())
+                            //    .filter(processor -> OperationAuthorizable.isOperationAuthorized(processor, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(processor -> {
+                                componentIds.add(processor.getIdentifier());
+                            });
+
+                    // ensure authorized for each input port we will attempt to schedule
+                    group.findAllInputPorts().stream()
+                            .filter(getPortFilter.get())
+                            //  .filter(inputPort -> OperationAuthorizable.isOperationAuthorized(inputPort, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(inputPort -> {
+                                componentIds.add(inputPort.getIdentifier());
+                            });
+
+                    // ensure authorized for each output port we will attempt to schedule
+                    group.findAllOutputPorts().stream()
+                            .filter(getPortFilter.get())
+                            //.filter(outputPort -> OperationAuthorizable.isOperationAuthorized(outputPort, authorizer, NiFiUserUtils.getNiFiUser()))
+                            .forEach(outputPort -> {
+                                componentIds.add(outputPort.getIdentifier());
+                            });
+
+                    return componentIds;
+                });
+
+                // build the component mapping
+                final Map<String, RevisionDTO> componentsToSchedule = new HashMap<>();
+                revisions.forEach(revision -> {
+                    final RevisionDTO dto = new RevisionDTO();
+                    dto.setClientId(revision.getClientId());
+                    dto.setVersion(revision.getVersion());
+                    componentsToSchedule.put(revision.getComponentId(), dto);
+                });
+
+                // set the components and their current revision
+                requestScheduleComponentsEntity.setComponents(componentsToSchedule);
+            }
+
+
+
+            final Map<String, RevisionDTO> requestComponentsToSchedule = requestScheduleComponentsEntity.getComponents();
+            final Map<String, Revision> requestComponentRevisions =
+                    requestComponentsToSchedule.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> getRevision(e.getValue(), e.getKey())));
+            final Set<Revision> requestRevisions = new HashSet<>(requestComponentRevisions.values());
+
+
+            //STOP all components
+            serviceFacade.verifyScheduleComponents(parentGroup.getId(), state, requestComponentRevisions.keySet());
+            serviceFacade.scheduleComponents(parentGroup.getId(), state, requestComponentRevisions);
+
+
+
+            Set<DropRequestDTO> allDropRequests = new HashSet();
+
+            //DROP all groupID request
+            for (ConnectionEntity connection : serviceFacade.getConnections(parentGroup.getId())) {
+                // ensure the id is the same across the cluster
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+
+                    String dropRequestId = generateUuid();
+                    allDropRequests.add(serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId));
+                }
+            }
+            //delete all parent connections
+            for (ConnectionEntity connection : serviceFacade.getConnections(parentGroup.getId())) {
+
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+                    Revision rev = new Revision(connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
+                    serviceFacade.deleteConnection(rev, connection.getId());
+                }
+            }
+
+
+            ProcessGroupFlowEntity fe = serviceFacade.getProcessGroupFlow(parentGroup.getId());
+            ProcessGroupFlowDTO entityTest = fe.getProcessGroupFlow();
+            FlowDTO flow = entityTest.getFlow();
+            //Drop all flow connections
+            for (ConnectionEntity connection : flow.getConnections()) {
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+                    final String dropRequestId = generateUuid();
+                    allDropRequests.add(serviceFacade.createFlowFileDropRequest(connection.getId(), dropRequestId));
+                }
+            }
+
+            //Delete All flow connections
+            for (ConnectionEntity connection : flow.getConnections()) {
+                if ((groupId.equals(connection.getDestinationGroupId())) || (groupId.equals(connection.getSourceGroupId()))) {
+                    Revision rev = new Revision(connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
+
+                    serviceFacade.deleteConnection(rev, connection.getId());
+                }
+            }
+
+            //TODO wait and check to to see if all drops requests are compelete
+            Set<ControllerServiceEntity> controllers = serviceFacade.getControllerServices(parentGroup.getId(), true, true);
+            for (ControllerServiceEntity controller : controllers) {
+                if (parentGroup.getId().equals(controller.getParentGroupId())) {
+                    serviceFacade.verifyCanClearControllerServiceState(controller.getId());
+                    serviceFacade.clearControllerServiceState(controller.getId());
+                }
+            }
+
+
+            for (PortEntity port : flow.getOutputPorts()) {
+                if (parentGroup.getId().equals(port.getComponent().getParentGroupId())) {
+                    Revision rev = new Revision(port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
+                    serviceFacade.deleteOutputPort(rev, port.getId());
+                }
+            }
+
+            for (PortEntity port : flow.getInputPorts()) {
+                if (parentGroup.getId().equals(port.getComponent().getParentGroupId())) {
+                    Revision rev = new Revision(port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
+                    serviceFacade.deleteInputPort(rev, port.getId());
+                }
+            }
+
+            for (FunnelEntity funnel : flow.getFunnels()) {
+                if (parentGroup.getId().equals(funnel.getComponent().getParentGroupId())) {
+
+                    Revision rev = new Revision(funnel.getRevision().getVersion(), funnel.getRevision().getClientId(), funnel.getComponent().getId());
+                    serviceFacade.deleteFunnel(rev, funnel.getId());
+                }
+            }
+
+
+            for (RemoteProcessGroupEntity processorGroupEntity : flow.getRemoteProcessGroups()) {
+                if (parentGroup.getId().equals(processorGroupEntity.getComponent().getParentGroupId())) {
+                    Revision rev = new Revision(processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
+                    serviceFacade.deleteRemoteProcessGroup(rev, processorGroupEntity.getId());
+                }
+            }
+
+            for (LabelEntity labelEntity : flow.getLabels()) {
+                if (parentGroup.getId().equals(labelEntity.getComponent().getParentGroupId())) {
+                    Revision rev = new Revision(labelEntity.getRevision().getVersion(), labelEntity.getRevision().getClientId(), labelEntity.getComponent().getId());
+                    serviceFacade.deleteLabel(rev, labelEntity.getId());
+                }
+            }
+
+            for (TemplateEntity templateEntity : serviceFacade.getTemplates()) {
+                if (parentGroup.getId().equals(templateEntity.getTemplate().getGroupId())) {
+                    serviceFacade.deleteTemplate(templateEntity.getId());
+                }
+            }
+
+
+            for (ControllerServiceEntity controller : controllers) {
+                if (parentGroup.getId().equals(controller.getParentGroupId())) {
+                    Revision rev = new Revision(controller.getRevision().getVersion(), controller.getRevision().getClientId(), controller.getComponent().getId());
+                    serviceFacade.deleteControllerService(rev, controller.getId());
+                }
+            }
+
+
+            Set<ProcessorEntity> processorEntities = serviceFacade.getProcessors(parentGroup.getId(), includeDescendantGroups);
+            for (ProcessorEntity processor : processorEntities) {
+                if (parentGroup.getId().equals(processor.getComponent().getParentGroupId())) {
+                    Revision rev = new Revision(processor.getRevision().getVersion(), processor.getRevision().getClientId(), processor.getComponent().getId());
+                    serviceFacade.deleteProcessor(rev, processor.getId());
+                }
+            }
+
+
+            for (ProcessGroupEntity processorGroupEntity : flow.getProcessGroups()) {
+                if (parentGroup.getId().equals(processorGroupEntity.getComponent().getParentGroupId()) && !groupId.equals(parentGroup.getComponent().getParentGroupId()) ) {
+                    Revision rev = new Revision(processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
+                    serviceFacade.deleteProcessGroup(rev, processorGroupEntity.getId());
+                }
+            }
+
+            //Do not delete root Process Group
+           if (!groupId.equals(parentGroup.getComponent().getParentGroupId())){
+            Revision processorRevision = new Revision(parentGroup.getRevision().getVersion(),
+                    parentGroup.getRevision().getClientId(),
+                    parentGroup.getComponent().getId());
+              Response response = withWriteLock(
+                    serviceFacade,
+                    parentGroup,
+                    processorRevision,
+                    lookup -> {
+                        final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(parentGroup.getId());
+
+                        // ensure write to this process group anEencapsulated components
+                        authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
+
+                        // ensure write permission to the parent process group, if applicable... if this is the root group the
+                        // request will fail later but still need to handle authorization here
+                        final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
+                        if (parentAuthorizable != null) {
+                            parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+                        }
+                    },
+                    () -> serviceFacade.verifyDeleteProcessGroup(groupId),
+                    (revision, processGroupEntity) -> {
+                        // delete the process group
+                        final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
+
+                        // prune response as necessary
+                        if (entity.getComponent() != null) {
+                            entity.getComponent().setContents(null);
                         }
 
-
-                    for( PortEntity port : flow.getOutputPorts()){
-
-
-                        Revision rev = new Revision( port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
-                        serviceFacade.deleteOutputPort( rev, port.getId());
+                        // create the response
+                        return generateOkResponse(entity).build();
                     }
+                  );
+              }
 
-                    for( PortEntity port : flow.getInputPorts()){
-                        Revision rev = new Revision( port.getRevision().getVersion(), port.getRevision().getClientId(), port.getComponent().getId());
-                        serviceFacade.deleteInputPort( rev, port.getId());
-                    }
+        } catch (final Exception e) {
+            logger.error("Failed to remove for Processor Group with ID " + groupId, e);
+        } finally {
+            // clear the authentication token
+            SecurityContextHolder.getContext().setAuthentication(null);
+        }
 
-                    for( FunnelEntity funnel : flow.getFunnels()){
-                        Revision rev = new Revision( funnel.getRevision().getVersion(), funnel.getRevision().getClientId(), funnel.getComponent().getId());
-                        serviceFacade.deleteFunnel( rev, funnel.getId());
-                    }
-
-
-                    for( ProcessGroupEntity processorGroupEntity: flow.getProcessGroups()){
-                        Revision rev = new Revision( processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
-                        serviceFacade.deleteProcessGroup( rev, processorGroupEntity.getId());
-                    }
-
-
-                    for( RemoteProcessGroupEntity processorGroupEntity: flow.getRemoteProcessGroups()){
-                        Revision rev = new Revision( processorGroupEntity.getRevision().getVersion(), processorGroupEntity.getRevision().getClientId(), processorGroupEntity.getComponent().getId());
-                        serviceFacade.deleteRemoteProcessGroup( rev, processorGroupEntity.getId());
-                    }
-
-
-                    for( LabelEntity labelEntity: flow.getLabels()){
-                        Revision rev = new Revision( labelEntity.getRevision().getVersion(), labelEntity.getRevision().getClientId(), labelEntity.getComponent().getId());
-                        serviceFacade.deleteLabel( rev, labelEntity.getId());
-                    }
-
-
-
-
-
-
-                    for (ConnectionEntity  connection: serviceFacade.getConnections(parentGroup.getId())) {
-                       Revision rev = new Revision( connection.getRevision().getVersion(), connection.getRevision().getClientId(), connection.getComponent().getId());
-                       serviceFacade.deleteFlowFileDropRequest(connection.getId(), UUID.randomUUID().toString() );
-
-                       serviceFacade.deleteConnection( rev, connection.getId());
-                   }
-                   Set<ControllerServiceEntity> controllers = serviceFacade.getControllerServices(parentGroup.getId(), true, true );
-                    for (ControllerServiceEntity  controller: controllers) {
-                        Revision rev = new Revision( controller.getRevision().getVersion(), controller.getRevision().getClientId(), controller.getComponent().getId());
-                        serviceFacade.deleteControllerService( rev, controller.getId());
-                    }
-
-
-
-
-
-
-                    // handle expects request (usually from the cluster manager)
-                    //  final Revision requestRevision = new Revision(version == null ? null : version.getLong(), clientId.getClientId(), id);
-                    Response response = withWriteLock(
-                            serviceFacade,
-                            parentGroup,
-                            requestRevision,
-                            lookup -> {
-                                final ProcessGroupAuthorizable processGroupAuthorizable = lookup.getProcessGroup(parentGroup.getId());
-
-                                // ensure write to this process group anEencapsulated components
-                                authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, RequestAction.WRITE, true, true, true, false, false);
-
-                                // ensure write permission to the parent process group, if applicable... if this is the root group the
-                                // request will fail later but still need to handle authorization here
-                                final Authorizable parentAuthorizable = processGroupAuthorizable.getAuthorizable().getParentAuthorizable();
-                                if (parentAuthorizable != null) {
-                                    parentAuthorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
-                                }
-                            },
-                            () -> serviceFacade.verifyDeleteProcessGroup(parentGroup.getId()),
-                            (revision, processGroupEntity) -> {
-                                // delete the process group
-                                final ProcessGroupEntity entity = serviceFacade.deleteProcessGroup(revision, processGroupEntity.getId());
-
-                                // prune response as necessary
-                                if (entity.getComponent() != null) {
-                                    entity.getComponent().setContents(null);
-                                }
-
-                                // create the response
-                                return generateOkResponse(entity).build();
-                            }
-                    );
-
-                } catch (final Exception e) {
-                    logger.error("Failed to remove for Processor Group with ID " + groupId, e);
-                } finally {
-                    // clear the authentication token
-                    SecurityContextHolder.getContext().setAuthentication(null);
-                }
-       //     }
-     //   };
-
-        // Submit the task to be run in the background
-     //   deleteProcessorGroupThreadPool.submit(removeTask);
-        return  generateOkResponse(parentGroup).build();
+        return generateOkResponse(parentGroup).build();
     }
 
 
