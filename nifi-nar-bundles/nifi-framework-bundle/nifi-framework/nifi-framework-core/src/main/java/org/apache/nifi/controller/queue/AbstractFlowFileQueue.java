@@ -258,29 +258,20 @@ public abstract class AbstractFlowFileQueue implements FlowFileQueue {
 
     @Override
     public DropFlowFileStatus dropFlowFiles(final String requestIdentifier, final String requestor) {
-        logger.info("Initiating drop of FlowFiles from {} on behalf of {} (request identifier={})", this, requestor, requestIdentifier);
-
-        // purge any old requests from the map just to keep it clean. But if there are very requests, which is usually the case, then don't bother
-        if (dropRequestMap.size() > 10) {
-            final List<String> toDrop = new ArrayList<>();
-            for (final Map.Entry<String, DropFlowFileRequest> entry : dropRequestMap.entrySet()) {
-                final DropFlowFileRequest request = entry.getValue();
-                final boolean completed = request.getState() == DropFlowFileState.COMPLETE || request.getState() == DropFlowFileState.FAILURE;
-
-                if (completed && System.currentTimeMillis() - request.getLastUpdated() > TimeUnit.MINUTES.toMillis(5L)) {
-                    toDrop.add(entry.getKey());
-                }
-            }
-
-            for (final String requestId : toDrop) {
-                dropRequestMap.remove(requestId);
-            }
-        }
-
-        final DropFlowFileRequest dropRequest = new DropFlowFileRequest(requestIdentifier);
+        return dropFlowFiles(requestIdentifier, requestor, null);
+    }
+    
+    @Override
+    public DropFlowFileStatus dropFlowFiles(final String requestIdentifier, 
+                                            final String requestor,
+                                            final List<String> flowFileUuids) {
+        final DropFlowFileRequest dropRequest = createDropFlowFilesRequest(requestIdentifier, requestor);
         final QueueSize originalSize = size();
         dropRequest.setCurrentSize(originalSize);
         dropRequest.setOriginalSize(originalSize);
+        if (flowFileUuids != null) {
+            dropRequest.setFlowFileUuids(flowFileUuids);
+        }
         if (originalSize.getObjectCount() == 0) {
             dropRequest.setDroppedSize(originalSize);
             dropRequest.setState(DropFlowFileState.COMPLETE);
@@ -301,7 +292,28 @@ public abstract class AbstractFlowFileQueue implements FlowFileQueue {
 
         return dropRequest;
     }
+    
+    private DropFlowFileRequest createDropFlowFilesRequest(final String requestIdentifier, final String requestor) {
+    	logger.info("Initiating drop of FlowFiles from {} on behalf of {} (request identifier={})", this, requestor, requestIdentifier);
 
+        // purge any old requests from the map just to keep it clean. But if there are very requests, which is usually the case, then don't bother
+        if (dropRequestMap.size() > 10) {
+            final List<String> toDrop = new ArrayList<>();
+            for (final Map.Entry<String, DropFlowFileRequest> entry : dropRequestMap.entrySet()) {
+                final DropFlowFileRequest request = entry.getValue();
+                final boolean completed = request.getState() == DropFlowFileState.COMPLETE || request.getState() == DropFlowFileState.FAILURE;
+
+                if (completed && System.currentTimeMillis() - request.getLastUpdated() > TimeUnit.MINUTES.toMillis(5L)) {
+                    toDrop.add(entry.getKey());
+                }
+            }
+
+            for (final String requestId : toDrop) {
+                dropRequestMap.remove(requestId);
+            }
+        }
+        return new DropFlowFileRequest(requestIdentifier);
+    }
 
     @Override
     public DropFlowFileRequest cancelDropFlowFileRequest(final String requestIdentifier) {
