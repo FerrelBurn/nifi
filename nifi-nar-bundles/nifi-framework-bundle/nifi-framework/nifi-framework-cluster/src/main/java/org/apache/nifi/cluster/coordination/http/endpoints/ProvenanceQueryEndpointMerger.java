@@ -45,7 +45,7 @@ public class ProvenanceQueryEndpointMerger implements EndpointResponseMerger {
 
     @Override
     public boolean canHandle(URI uri, String method) {
-        if ("POST".equalsIgnoreCase(method) && PROVENANCE_URI.equals(uri.getPath())) {
+        if ("POST".equalsIgnoreCase(method) && PROVENANCE_URI.endsWith(uri.getPath())) {
             return true;
         } else if ("GET".equalsIgnoreCase(method) && PROVENANCE_QUERY_URI.matcher(uri.getPath()).matches()) {
             return true;

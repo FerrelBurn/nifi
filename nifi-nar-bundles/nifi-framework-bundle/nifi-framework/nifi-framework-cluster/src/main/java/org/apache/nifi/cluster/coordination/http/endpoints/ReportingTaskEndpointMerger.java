@@ -40,7 +40,7 @@ public class ReportingTaskEndpointMerger  extends AbstractSingleEntityEndpoint<R
             return true;
         } else if ("PUT".equalsIgnoreCase(method) && REPORTING_TASK_RUN_STATUS_URI_PATTERN.matcher(uri.getPath()).matches()) {
             return true;
-        } else if ("POST".equalsIgnoreCase(method) && REPORTING_TASKS_URI.equals(uri.getPath())) {
+        } else if ("POST".equalsIgnoreCase(method) && REPORTING_TASKS_URI.endsWith(uri.getPath())) {
             return true;
         }
 

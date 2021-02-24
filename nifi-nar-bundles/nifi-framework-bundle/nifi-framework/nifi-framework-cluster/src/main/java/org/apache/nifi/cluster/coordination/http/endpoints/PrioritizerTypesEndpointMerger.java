@@ -25,13 +25,14 @@ import org.apache.nifi.web.api.entity.PrioritizerTypesEntity;
 import java.net.URI;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 public class PrioritizerTypesEndpointMerger extends AbstractNodeStatusEndpoint<PrioritizerTypesEntity, Set<DocumentedTypeDTO>> {
-    public static final String PRIORITIZER_TYPES_URI_PATTERN = "/nifi-api/flow/prioritizers";
+    public static final Pattern PRIORITIZER_TYPES_URI_PATTERN = Pattern.compile(".*/nifi-api/flow/prioritizers");
 
     @Override
     public boolean canHandle(URI uri, String method) {
-        return "GET".equalsIgnoreCase(method) && PRIORITIZER_TYPES_URI_PATTERN.equals(uri.getPath());
+        return "GET".equalsIgnoreCase(method) && PRIORITIZER_TYPES_URI_PATTERN.matcher(uri.getPath()).matches();
     }
 
     @Override

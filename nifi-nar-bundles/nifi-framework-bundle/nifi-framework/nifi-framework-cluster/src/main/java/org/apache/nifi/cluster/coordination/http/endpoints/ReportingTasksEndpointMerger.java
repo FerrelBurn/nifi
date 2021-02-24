@@ -34,7 +34,7 @@ public class ReportingTasksEndpointMerger  implements EndpointResponseMerger {
 
     @Override
     public boolean canHandle(URI uri, String method) {
-        return "GET".equalsIgnoreCase(method) && REPORTING_TASKS_URI.equals(uri.getPath());
+        return "GET".equalsIgnoreCase(method) && REPORTING_TASKS_URI.endsWith(uri.getPath());
     }
 
     @Override

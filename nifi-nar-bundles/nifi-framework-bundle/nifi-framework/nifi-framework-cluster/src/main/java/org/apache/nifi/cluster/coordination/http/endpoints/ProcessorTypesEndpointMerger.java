@@ -25,13 +25,14 @@ import org.apache.nifi.web.api.entity.ProcessorTypesEntity;
 import java.net.URI;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 public class ProcessorTypesEndpointMerger extends AbstractNodeStatusEndpoint<ProcessorTypesEntity, Set<DocumentedTypeDTO>> {
-    public static final String PROCESSOR_TYPES_URI_PATTERN = "/nifi-api/flow/processor-types";
+    public static final Pattern PROCESSOR_TYPES_URI_PATTERN = Pattern.compile(".*/nifi-api/flow/processor-types");
 
     @Override
     public boolean canHandle(URI uri, String method) {
-        return "GET".equalsIgnoreCase(method) && PROCESSOR_TYPES_URI_PATTERN.equals(uri.getPath());
+        return "GET".equalsIgnoreCase(method) && PROCESSOR_TYPES_URI_PATTERN.matcher(uri.getPath()).matches();
     }
 
     @Override

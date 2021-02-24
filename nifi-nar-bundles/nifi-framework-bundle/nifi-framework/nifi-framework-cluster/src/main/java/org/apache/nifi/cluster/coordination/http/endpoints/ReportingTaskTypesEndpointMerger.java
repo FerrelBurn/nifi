@@ -25,13 +25,14 @@ import org.apache.nifi.web.api.entity.ReportingTaskTypesEntity;
 import java.net.URI;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 public class ReportingTaskTypesEndpointMerger extends AbstractNodeStatusEndpoint<ReportingTaskTypesEntity, Set<DocumentedTypeDTO>> {
-    public static final String REPORTING_TASK_TYPES_URI_PATTERN = "/nifi-api/flow/reporting-task-types";
+    public static final Pattern REPORTING_TASK_TYPES_URI_PATTERN = Pattern.compile(".*/nifi-api/flow/reporting-task-types");
 
     @Override
     public boolean canHandle(URI uri, String method) {
-        return "GET".equalsIgnoreCase(method) && REPORTING_TASK_TYPES_URI_PATTERN.equals(uri.getPath());
+        return "GET".equalsIgnoreCase(method) && REPORTING_TASK_TYPES_URI_PATTERN.matcher(uri.getPath()).matches();
     }
 
     @Override
